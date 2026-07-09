@@ -9,13 +9,13 @@ const REPOS_DIR = path.resolve('./repos');
 
 if (!fs.existsSync(REPOS_DIR)) { fs.mkdirSync(REPOS_DIR); }
 
-// Secure Helper: Run OS process as an asynchronous stream promise with a resource guard
+// Secure Helper: Run OS process as an asynchronous stream promise with resource guard
 function runCommand(cmd, args, cwd) {
     return new Promise((resolve, reject) => {
         const child = spawn(cmd, args, { cwd, shell: false });
         let stdout = '';
         let stderr = '';
-        let finished = false; // Execution race condition patch
+        let finished = false;
 
         const timer = setTimeout(() => {
             if (finished) return;
@@ -44,17 +44,20 @@ function runCommand(cmd, args, cwd) {
     });
 }
 
-// Fencepost Bug Fix Helper: Extract historical file coupling per commit group
+// Bug Fix: Hardened process coupling to prevent runtime object crashes
 function processCommitCoupling(files, metrics) {
     if (files.length < 2) return;
     files.forEach(a => {
+        if (!metrics[a]) return; // Reference guard boundary
         files.forEach(b => {
-            if (a !== b) metrics[a].co_changes.add(b);
+            if (a !== b) {
+                // Optimization: Track raw edge co-change frequencies via a map dictionary
+                metrics[a].co_changes[b] = (metrics[a].co_changes[b] || 0) + 1;
+            }
         });
     });
 }
 
-// Security Helper: Eradicate path traversal attacks via strict 12-char SHA256 hex matching
 function getSafeRepoPath(repoId) {
     if (!/^[a-f0-9]{12}$/.test(repoId)) throw new Error('Malformed repository ID');
     return path.join(REPOS_DIR, repoId);
@@ -69,7 +72,7 @@ const server = http.createServer(async (req, res) => {
 
     const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
 
-    // ROUTE 1: Clone Target Repository & Generate SHA256 Token ID
+    // ROUTE 1: Ingest Repo Target
     if (req.method === 'POST' && parsedUrl.pathname === '/api/analyze') {
         let body = '';
         req.on('data', chunk => body += chunk.toString());
@@ -101,7 +104,7 @@ const server = http.createServer(async (req, res) => {
         });
     } 
     
-    // ROUTE 2: Extract Churn, Contextual File Domains, and Historical Coupling Metrics
+    // ROUTE 2: Structural Pipeline, Percentile Matrix Evaluation & Edge Topological Generation
     else if (req.method === 'GET' && parsedUrl.pathname === '/api/metrics') {
         try {
             const repoId = parsedUrl.searchParams.get('id');
@@ -133,7 +136,7 @@ const server = http.createServer(async (req, res) => {
 
                 const parts = trimmed.split(/\s+/);
                 if (parts.length === 3) {
-                    if (parts[0] === '-' || parts[1] === '-') return; // Ignore binary tracking output logs
+                    if (parts[0] === '-' || parts[1] === '-') return; 
 
                     const added = parseInt(parts[0], 10) || 0;
                     const deleted = parseInt(parts[1], 10) || 0;
@@ -146,8 +149,8 @@ const server = http.createServer(async (req, res) => {
                             additions: 0,
                             deletions: 0,
                             commit_frequency: 0,
-                            authors: {}, // Structuring an author-to-file edit concentration graph
-                            co_changes: new Set()
+                            authors: {}, 
+                            co_changes: {} // Optimization: Set collection updated to dictionary tracking counter
                         };
                     }
 
@@ -160,18 +163,16 @@ const server = http.createServer(async (req, res) => {
                 }
             });
 
-            // Process trailing commit remaining outside the string split sequence
             processCommitCoupling(filesInCurrentCommit, fileMetrics);
 
             const rawNodes = [];
+            const validTrackedFiles = new Set();
             
-            // Map-reduce nodes with single-hit system stats call verification
             Object.keys(fileMetrics).forEach(filePath => {
                 const absolutePath = path.join(targetPath, filePath);
                 
                 try {
                     const stats = fs.statSync(absolutePath);
-                    // OOM Prevention Guard: Reject files exceeding 1MB heap allocations
                     if (!stats.isFile() || stats.size > 1024 * 1024) return;
 
                     const content = fs.readFileSync(absolutePath, 'utf8');
@@ -182,7 +183,6 @@ const server = http.createServer(async (req, res) => {
                     const stabilityRatio = metrics.deletions / (totalMutations || 1);
                     const authorCount = Object.keys(metrics.authors).length;
 
-                    // Trace top author concentration metrics
                     let topAuthor = 'Unknown';
                     let maxAuthorImpact = 0;
                     Object.entries(metrics.authors).forEach(([author, linesTouched]) => {
@@ -195,34 +195,33 @@ const server = http.createServer(async (req, res) => {
                     const knowledgeConcentration = maxAuthorImpact / (totalMutations || 1);
                     const busFactor = (knowledgeConcentration > 0.8 && metrics.commit_frequency > 5) ? 1 : authorCount;
 
+                    validTrackedFiles.add(filePath);
                     rawNodes.push({
                         id: filePath,
                         lines_of_code: loc,
                         commit_frequency: metrics.commit_frequency,
                         author_count: authorCount,
-                        historical_coupling_score: metrics.co_changes.size,
+                        historical_coupling_score: Object.keys(metrics.co_changes).length,
                         stability_ratio: stabilityRatio,
                         knowledge_owner: topAuthor,
                         bus_factor: busFactor,
                         knowledge_concentration: parseFloat(knowledgeConcentration.toFixed(2))
                     });
                 } catch (e) {
-                    // Fail silently for deleted or moved system assets
+                    // Silent fail safe drop for deleted file tracks
                 }
             });
 
             if (rawNodes.length === 0) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ status: 'success', repo_id: repoId, nodes: [] }));
+                return res.end(JSON.stringify({ status: 'success', repo_id: repoId, nodes: [], links: [] }));
             }
 
-            // Percentile Position Normalization Function Engine
             const getPercentile = (arr, val, key) => {
                 const lowerCount = arr.filter(item => item[key] <= val).length;
                 return lowerCount / arr.length;
             };
 
-            // File Domain Context Dictionaries
             const DOC_EXTENSIONS = ['.md', '.txt', '.rst', '.adoc', 'LICENSE', 'NOTICE'];
             const INFRA_FILES = ['Dockerfile', 'Makefile', 'Jenkinsfile', 'docker-compose.yml', 'package.json', 'go.mod', 'Cargo.toml'];
             const PIPELINE_EXTENSIONS = ['.yml', '.yaml', '.json'];
@@ -233,10 +232,8 @@ const server = http.createServer(async (req, res) => {
                 const pStability = getPercentile(rawNodes, node.stability_ratio, 'stability_ratio');
                 const pCoupling = getPercentile(rawNodes, node.historical_coupling_score, 'historical_coupling_score');
 
-                // Self-adjusting relative activity score index bound cleanly between 0.00 and 1.00
                 const compositeRisk = (pFreq * 0.3) + (pAuthors * 0.2) + (pStability * 0.4) + (pCoupling * 0.1);
 
-                // Context Classifier Engine
                 const fileName = path.basename(node.id);
                 let componentType = 'source_code';
                 let tag = 'stable_component';
@@ -245,13 +242,12 @@ const server = http.createServer(async (req, res) => {
                     componentType = 'documentation';
                 } else if (INFRA_FILES.includes(fileName)) {
                     componentType = 'infrastructure';
-                } else if (node.id.includes('.github/workflows/') || (PIPELINE_EXTENSIONS.some(ext => node.id.endsWith(ext)) && node.id.includes('config'))) {
+                } else if (node.id.startsWith('.github/')) { // Optimization: Widened match scope covering infrastructure profiles
                     componentType = 'pipeline';
                 } else if (node.id.includes('test') || node.id.startsWith('tests/')) {
                     componentType = 'testing';
                 }
 
-                // Domain-Aware Behavioral Taxonomy Rules 
                 if (componentType === 'documentation') {
                     tag = compositeRisk > 0.75 ? 'documentation_hotspot' : 'stable_docs';
                 } else if (componentType === 'infrastructure' || componentType === 'pipeline') {
@@ -283,10 +279,38 @@ const server = http.createServer(async (req, res) => {
                 };
             });
 
+            // Weighted Topological Link Extraction & Mapping
+            const links = [];
+            const seenNetworkEdges = new Set();
+
+            for (const [file, metrics] of Object.entries(fileMetrics)) {
+                if (!validTrackedFiles.has(file)) continue;
+
+                for (const [related, count] of Object.entries(metrics.co_changes)) {
+                    if (!validTrackedFiles.has(related) || file === related) continue;
+
+                    const edgeTokenKey = [file, related].sort().join('|');
+
+                    if (seenNetworkEdges.has(edgeTokenKey)) continue;
+                    seenNetworkEdges.add(edgeTokenKey);
+
+                    links.push({
+                        source: file,
+                        target: related,
+                        weight: count // Optimization: Exposing precise co-change impact frequencies
+                    });
+                }
+            }
+
             finalizedNodes.sort((a, b) => b.structural_risk_index - a.structural_risk_index);
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ status: 'success', repo_id: repoId, nodes: finalizedNodes }));
+            return res.end(JSON.stringify({
+                status: 'success',
+                repo_id: repoId,
+                nodes: finalizedNodes,
+                links: links
+            }));
         } catch (err) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ error: err.message }));
@@ -297,4 +321,4 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
-server.listen(PORT, () => console.log(`[SERVER] Context-aware metrics engine online on port ${PORT}...`));
+server.listen(PORT, () => console.log(`[SERVER] Graph Engine frozen on port ${PORT}...`));
