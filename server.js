@@ -2,77 +2,132 @@ const http = require('http');
 const { exec } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 
 const PORT = 5000;
 
-// Ensure a directory exists to hold the cloned repositories
-if (!fs.existsSync('./repos')) {
-    fs.mkdirSync('./repos');
-}
+if (!fs.existsSync('./repos')) { fs.mkdirSync('./repos'); }
 
 const server = http.createServer((req, res) => {
-    // Set CORS headers so your frontend browser client won't be blocked later
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-    // Handle browser pre-flight verification requests
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204);
-        res.end();
-        return;
-    }
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-    // Route: POST /api/analyze
-    if (req.method === 'POST' && req.url === '/api/analyze') {
+    const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+
+    // ROUTE 1: Ingest URL and Clone
+    if (req.method === 'POST' && parsedUrl.pathname === '/api/analyze') {
         let body = '';
-
-        // Accumulate incoming data stream chunks
-        req.on('data', chunk => {
-            body += chunk.toString();
-        });
-
+        req.on('data', chunk => body += chunk.toString());
         req.on('end', () => {
             try {
-                const data = JSON.parse(body);
-                const repoUrl = data.url;
-
-                // Basic validation: Check if it's a structural git string link
+                const { url: repoUrl } = JSON.parse(body);
                 if (!repoUrl || !repoUrl.startsWith('https://')) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'Invalid or missing repository URL' }));
-                    return;
+                    return res.end(JSON.stringify({ error: 'Invalid URL' }));
                 }
 
-                // Generate a deterministic, unique directory name based on a hash of the URL
                 const uniqueId = crypto.createHash('md5').update(repoUrl).digest('hex').substring(0, 8);
                 const targetPath = `./repos/${uniqueId}`;
 
-                console.log(`[EXEC] Starting git clone for: ${repoUrl} into ${targetPath}`);
-
-                // Spawn the OS shell process asynchronously
-                exec(`git clone --depth 100 ${repoUrl} ${targetPath}`, (error, stdout, stderr) => {
-                    if (error) {
-                        console.error(`[ERROR] Clone failed: ${error.message}`);
-                        res.writeHead(500, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ error: 'Failed to clone repository', details: stderr }));
-                        return;
-                    }
-
-                    console.log(`[SUCCESS] Cloned successfully into ${targetPath}`);
-                    
-                    // Return response payload contract back to client
+                if (fs.existsSync(targetPath)) {
+                    console.log(`[SYSTEM] Repo already exists locally at ${targetPath}`);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ 
-                        status: 'success', 
-                        repo_id: uniqueId 
-                    }));
-                });
+                    return res.end(JSON.stringify({ status: 'success', repo_id: uniqueId }));
+                }
 
-            } catch (parseError) {
+                console.log(`[EXEC] Cloning: ${repoUrl}`);
+                exec(`git clone --depth 100 ${repoUrl} ${targetPath}`, (err, stdout, stderr) => {
+                    if (err) {
+                        res.writeHead(500, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ error: 'Clone failed', details: stderr }));
+                    }
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ status: 'success', repo_id: uniqueId }));
+                });
+            } catch (e) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Malformed JSON payload' }));
+                res.end(JSON.stringify({ error: 'Malformed JSON' }));
             }
+        });
+    } 
+    
+    // ROUTE 2: Extract Telemetry & Calculate Friction Matrix
+    else if (req.method === 'GET' && parsedUrl.pathname === '/api/metrics') {
+        const repoId = parsedUrl.searchParams.get('id');
+        const targetPath = `./repos/${repoId}`;
+
+        if (!repoId || !fs.existsSync(targetPath)) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'Repository not found. Run /api/analyze first.' }));
+        }
+
+        console.log(`[EXEC] Gathering Git telemetry for repo: ${repoId}`);
+
+        // Command returns: [lines added] [lines deleted] [filepath] for every commit
+        const gitCmd = `git -C ${targetPath} log --numstat --pretty=format:""`;
+
+        exec(gitCmd, (err, stdout) => {
+            if (err) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'Failed to extract git logs' }));
+            }
+
+            const fileMetrics = {};
+            const lines = stdout.split('\n');
+
+            // Parse raw text logs line-by-line
+            lines.forEach(line => {
+                const parts = line.trim().split(/\s+/);
+                if (parts.length === 3) {
+                    const added = parseInt(parts[0], 10) || 0;
+                    const deleted = parseInt(parts[1], 10) || 0;
+                    const filePath = parts[2];
+
+                    // Exclude hidden git/config assets or lockfiles
+                    if (filePath.includes('.git/') || filePath.endsWith('lock.json')) return;
+
+                    if (!fileMetrics[filePath]) {
+                        fileMetrics[filePath] = { churn: 0, volume: 0 };
+                    }
+                    fileMetrics[filePath].churn += (added + deleted);
+                }
+            });
+
+            // Calculate Volume (LOC) by physically looking at files left inside directory
+            const nodes = [];
+            Object.keys(fileMetrics).forEach(filePath => {
+                const absolutePath = path.join(targetPath, filePath);
+                
+                try {
+                    if (fs.existsSync(absolutePath) && fs.statSync(absolutePath).isFile()) {
+                        const content = fs.readFileSync(absolutePath, 'utf8');
+                        const loc = content.split('\n').length;
+
+                        fileMetrics[filePath].volume = loc;
+                        
+                        // Operational Formula: Friction Index = Churn * Volume
+                        const frictionIndex = fileMetrics[filePath].churn * loc;
+
+                        nodes.push({
+                            id: filePath,
+                            churn: fileMetrics[filePath].churn,
+                            volume: loc,
+                            friction_score: frictionIndex
+                        });
+                    }
+                } catch (e) {
+                    // File existed in logs but was completely deleted over time, safe to ignore
+                }
+            });
+
+            // Sort nodes descending so the frontend immediately knows the worst technical debt hotspots
+            nodes.sort((a, b) => b.friction_score - a.friction_score);
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'success', repo_id: repoId, nodes: nodes }));
         });
     } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -80,6 +135,4 @@ const server = http.createServer((req, res) => {
     }
 });
 
-server.listen(PORT, () => {
-    console.log(`[SYSTEM] Backend engine listening on port ${PORT}...`);
-});
+server.listen(PORT, () => console.log(`[SYSTEM] Orchestration Engine running on port ${PORT}...`));
