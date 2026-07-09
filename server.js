@@ -1,14 +1,66 @@
 const http = require('http');
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = 5000;
+const REPOS_DIR = path.resolve('./repos');
 
-if (!fs.existsSync('./repos')) { fs.mkdirSync('./repos'); }
+if (!fs.existsSync(REPOS_DIR)) { fs.mkdirSync(REPOS_DIR); }
 
-const server = http.createServer((req, res) => {
+// Secure Helper: Run OS process as an asynchronous stream promise with a resource guard
+function runCommand(cmd, args, cwd) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(cmd, args, { cwd, shell: false });
+        let stdout = '';
+        let stderr = '';
+        let finished = false; // Execution race condition patch
+
+        const timer = setTimeout(() => {
+            if (finished) return;
+            finished = true;
+            child.kill();
+            reject(new Error('Process execution timed out'));
+        }, 45000);
+
+        child.stdout.on('data', chunk => { if (!finished) stdout += chunk.toString(); });
+        child.stderr.on('data', chunk => { if (!finished) stderr += chunk.toString(); });
+        
+        child.on('close', code => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            if (code !== 0) reject(new Error(stderr.trim() || `Exited with code ${code}`));
+            else resolve(stdout);
+        });
+
+        child.on('error', err => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            reject(err);
+        });
+    });
+}
+
+// Fencepost Bug Fix Helper: Extract historical file coupling per commit group
+function processCommitCoupling(files, metrics) {
+    if (files.length < 2) return;
+    files.forEach(a => {
+        files.forEach(b => {
+            if (a !== b) metrics[a].co_changes.add(b);
+        });
+    });
+}
+
+// Security Helper: Eradicate path traversal attacks via strict 12-char SHA256 hex matching
+function getSafeRepoPath(repoId) {
+    if (!/^[a-f0-9]{12}$/.test(repoId)) throw new Error('Malformed repository ID');
+    return path.join(REPOS_DIR, repoId);
+}
+
+const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -17,122 +69,232 @@ const server = http.createServer((req, res) => {
 
     const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
 
-    // ROUTE 1: Ingest URL and Clone
+    // ROUTE 1: Clone Target Repository & Generate SHA256 Token ID
     if (req.method === 'POST' && parsedUrl.pathname === '/api/analyze') {
         let body = '';
         req.on('data', chunk => body += chunk.toString());
-        req.on('end', () => {
+        req.on('end', async () => {
             try {
                 const { url: repoUrl } = JSON.parse(body);
-                if (!repoUrl || !repoUrl.startsWith('https://')) {
+                if (!repoUrl || !repoUrl.startsWith('https://github.com/')) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
-                    return res.end(JSON.stringify({ error: 'Invalid URL' }));
+                    return res.end(JSON.stringify({ error: 'Invalid GitHub URL.' }));
                 }
 
-                const uniqueId = crypto.createHash('md5').update(repoUrl).digest('hex').substring(0, 8);
-                const targetPath = `./repos/${uniqueId}`;
+                const uniqueId = crypto.createHash('sha256').update(repoUrl).digest('hex').substring(0, 12);
+                const targetPath = path.join(REPOS_DIR, uniqueId);
 
                 if (fs.existsSync(targetPath)) {
-                    console.log(`[SYSTEM] Repo already exists locally at ${targetPath}`);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     return res.end(JSON.stringify({ status: 'success', repo_id: uniqueId }));
                 }
 
-                console.log(`[EXEC] Cloning: ${repoUrl}`);
-                exec(`git clone --depth 100 ${repoUrl} ${targetPath}`, (err, stdout, stderr) => {
-                    if (err) {
-                        res.writeHead(500, { 'Content-Type': 'application/json' });
-                        return res.end(JSON.stringify({ error: 'Clone failed', details: stderr }));
-                    }
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ status: 'success', repo_id: uniqueId }));
-                });
+                console.log(`[EXEC] Running non-blocking clone for: ${repoUrl}`);
+                await runCommand('git', ['clone', '--depth', '100', repoUrl, targetPath]);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ status: 'success', repo_id: uniqueId }));
             } catch (e) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Malformed JSON' }));
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'Ingestion failed', details: e.message }));
             }
         });
     } 
     
-    // ROUTE 2: Extract Telemetry & Calculate Friction Matrix
+    // ROUTE 2: Extract Churn, Contextual File Domains, and Historical Coupling Metrics
     else if (req.method === 'GET' && parsedUrl.pathname === '/api/metrics') {
-        const repoId = parsedUrl.searchParams.get('id');
-        const targetPath = `./repos/${repoId}`;
+        try {
+            const repoId = parsedUrl.searchParams.get('id');
+            const targetPath = getSafeRepoPath(repoId);
 
-        if (!repoId || !fs.existsSync(targetPath)) {
-            res.writeHead(404, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ error: 'Repository not found. Run /api/analyze first.' }));
-        }
-
-        console.log(`[EXEC] Gathering Git telemetry for repo: ${repoId}`);
-
-        // Command returns: [lines added] [lines deleted] [filepath] for every commit
-        const gitCmd = `git -C ${targetPath} log --numstat --pretty=format:""`;
-
-        exec(gitCmd, (err, stdout) => {
-            if (err) {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ error: 'Failed to extract git logs' }));
+            if (!fs.existsSync(targetPath)) {
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'Repository not found.' }));
             }
 
-            const fileMetrics = {};
-            const lines = stdout.split('\n');
+            console.log(`[EXEC] Scraping commit streams for token: ${repoId}`);
+            const logDump = await runCommand('git', ['-C', targetPath, 'log', '--numstat', '--pretty=format:COMMIT|%an']);
 
-            // Parse raw text logs line-by-line
+            const fileMetrics = {};
+            const lines = logDump.split('\n');
+            let currentAuthor = 'Unknown';
+            let filesInCurrentCommit = [];
+
             lines.forEach(line => {
-                const parts = line.trim().split(/\s+/);
+                const trimmed = line.trim();
+                if (!trimmed) return;
+
+                if (trimmed.startsWith('COMMIT|')) {
+                    processCommitCoupling(filesInCurrentCommit, fileMetrics);
+                    filesInCurrentCommit = [];
+                    currentAuthor = trimmed.split('|')[1] || 'Unknown';
+                    return;
+                }
+
+                const parts = trimmed.split(/\s+/);
                 if (parts.length === 3) {
+                    if (parts[0] === '-' || parts[1] === '-') return; // Ignore binary tracking output logs
+
                     const added = parseInt(parts[0], 10) || 0;
                     const deleted = parseInt(parts[1], 10) || 0;
                     const filePath = parts[2];
 
-                    // Exclude hidden git/config assets or lockfiles
                     if (filePath.includes('.git/') || filePath.endsWith('lock.json')) return;
 
                     if (!fileMetrics[filePath]) {
-                        fileMetrics[filePath] = { churn: 0, volume: 0 };
+                        fileMetrics[filePath] = {
+                            additions: 0,
+                            deletions: 0,
+                            commit_frequency: 0,
+                            authors: {}, // Structuring an author-to-file edit concentration graph
+                            co_changes: new Set()
+                        };
                     }
-                    fileMetrics[filePath].churn += (added + deleted);
+
+                    const metrics = fileMetrics[filePath];
+                    metrics.additions += added;
+                    metrics.deletions += deleted;
+                    metrics.commit_frequency += 1;
+                    metrics.authors[currentAuthor] = (metrics.authors[currentAuthor] || 0) + (added + deleted);
+                    filesInCurrentCommit.push(filePath);
                 }
             });
 
-            // Calculate Volume (LOC) by physically looking at files left inside directory
-            const nodes = [];
+            // Process trailing commit remaining outside the string split sequence
+            processCommitCoupling(filesInCurrentCommit, fileMetrics);
+
+            const rawNodes = [];
+            
+            // Map-reduce nodes with single-hit system stats call verification
             Object.keys(fileMetrics).forEach(filePath => {
                 const absolutePath = path.join(targetPath, filePath);
                 
                 try {
-                    if (fs.existsSync(absolutePath) && fs.statSync(absolutePath).isFile()) {
-                        const content = fs.readFileSync(absolutePath, 'utf8');
-                        const loc = content.split('\n').length;
+                    const stats = fs.statSync(absolutePath);
+                    // OOM Prevention Guard: Reject files exceeding 1MB heap allocations
+                    if (!stats.isFile() || stats.size > 1024 * 1024) return;
 
-                        fileMetrics[filePath].volume = loc;
-                        
-                        // Operational Formula: Friction Index = Churn * Volume
-                        const frictionIndex = fileMetrics[filePath].churn * loc;
+                    const content = fs.readFileSync(absolutePath, 'utf8');
+                    const loc = content.split('\n').length;
 
-                        nodes.push({
-                            id: filePath,
-                            churn: fileMetrics[filePath].churn,
-                            volume: loc,
-                            friction_score: frictionIndex
-                        });
-                    }
+                    const metrics = fileMetrics[filePath];
+                    const totalMutations = metrics.additions + metrics.deletions;
+                    const stabilityRatio = metrics.deletions / (totalMutations || 1);
+                    const authorCount = Object.keys(metrics.authors).length;
+
+                    // Trace top author concentration metrics
+                    let topAuthor = 'Unknown';
+                    let maxAuthorImpact = 0;
+                    Object.entries(metrics.authors).forEach(([author, linesTouched]) => {
+                        if (linesTouched > maxAuthorImpact) {
+                            maxAuthorImpact = linesTouched;
+                            topAuthor = author;
+                        }
+                    });
+
+                    const knowledgeConcentration = maxAuthorImpact / (totalMutations || 1);
+                    const busFactor = (knowledgeConcentration > 0.8 && metrics.commit_frequency > 5) ? 1 : authorCount;
+
+                    rawNodes.push({
+                        id: filePath,
+                        lines_of_code: loc,
+                        commit_frequency: metrics.commit_frequency,
+                        author_count: authorCount,
+                        historical_coupling_score: metrics.co_changes.size,
+                        stability_ratio: stabilityRatio,
+                        knowledge_owner: topAuthor,
+                        bus_factor: busFactor,
+                        knowledge_concentration: parseFloat(knowledgeConcentration.toFixed(2))
+                    });
                 } catch (e) {
-                    // File existed in logs but was completely deleted over time, safe to ignore
+                    // Fail silently for deleted or moved system assets
                 }
             });
 
-            // Sort nodes descending so the frontend immediately knows the worst technical debt hotspots
-            nodes.sort((a, b) => b.friction_score - a.friction_score);
+            if (rawNodes.length === 0) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ status: 'success', repo_id: repoId, nodes: [] }));
+            }
+
+            // Percentile Position Normalization Function Engine
+            const getPercentile = (arr, val, key) => {
+                const lowerCount = arr.filter(item => item[key] <= val).length;
+                return lowerCount / arr.length;
+            };
+
+            // File Domain Context Dictionaries
+            const DOC_EXTENSIONS = ['.md', '.txt', '.rst', '.adoc', 'LICENSE', 'NOTICE'];
+            const INFRA_FILES = ['Dockerfile', 'Makefile', 'Jenkinsfile', 'docker-compose.yml', 'package.json', 'go.mod', 'Cargo.toml'];
+            const PIPELINE_EXTENSIONS = ['.yml', '.yaml', '.json'];
+
+            const finalizedNodes = rawNodes.map(node => {
+                const pFreq = getPercentile(rawNodes, node.commit_frequency, 'commit_frequency');
+                const pAuthors = getPercentile(rawNodes, node.author_count, 'author_count');
+                const pStability = getPercentile(rawNodes, node.stability_ratio, 'stability_ratio');
+                const pCoupling = getPercentile(rawNodes, node.historical_coupling_score, 'historical_coupling_score');
+
+                // Self-adjusting relative activity score index bound cleanly between 0.00 and 1.00
+                const compositeRisk = (pFreq * 0.3) + (pAuthors * 0.2) + (pStability * 0.4) + (pCoupling * 0.1);
+
+                // Context Classifier Engine
+                const fileName = path.basename(node.id);
+                let componentType = 'source_code';
+                let tag = 'stable_component';
+
+                if (DOC_EXTENSIONS.some(ext => node.id.endsWith(ext) || fileName === ext)) {
+                    componentType = 'documentation';
+                } else if (INFRA_FILES.includes(fileName)) {
+                    componentType = 'infrastructure';
+                } else if (node.id.includes('.github/workflows/') || (PIPELINE_EXTENSIONS.some(ext => node.id.endsWith(ext)) && node.id.includes('config'))) {
+                    componentType = 'pipeline';
+                } else if (node.id.includes('test') || node.id.startsWith('tests/')) {
+                    componentType = 'testing';
+                }
+
+                // Domain-Aware Behavioral Taxonomy Rules 
+                if (componentType === 'documentation') {
+                    tag = compositeRisk > 0.75 ? 'documentation_hotspot' : 'stable_docs';
+                } else if (componentType === 'infrastructure' || componentType === 'pipeline') {
+                    tag = compositeRisk > 0.75 ? 'volatile_config_bottleneck' : 'stable_environment';
+                } else if (componentType === 'testing') {
+                    tag = compositeRisk > 0.75 ? 'high_test_churn' : 'stable_test_suite';
+                } else {
+                    if (compositeRisk > 0.8) {
+                        tag = 'refactor_decay_hotspot';
+                    } else if (node.historical_coupling_score > 10 && node.author_count > 4) {
+                        tag = 'shared_bottleneck';
+                    } else if (node.stability_ratio < 0.15 && node.commit_frequency > 5) {
+                        tag = 'active_feature_growth';
+                    }
+                }
+
+                return {
+                    id: node.id,
+                    component_type: componentType,
+                    lines_of_code: node.lines_of_code,
+                    commit_frequency: node.commit_frequency,
+                    author_count: node.author_count,
+                    historical_coupling_score: node.historical_coupling_score,
+                    knowledge_owner: node.knowledge_owner,
+                    bus_factor: node.bus_factor,
+                    knowledge_concentration: node.knowledge_concentration,
+                    behavioral_tag: tag,
+                    structural_risk_index: parseFloat(compositeRisk.toFixed(2))
+                };
+            });
+
+            finalizedNodes.sort((a, b) => b.structural_risk_index - a.structural_risk_index);
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'success', repo_id: repoId, nodes: nodes }));
-        });
+            return res.end(JSON.stringify({ status: 'success', repo_id: repoId, nodes: finalizedNodes }));
+        } catch (err) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: err.message }));
+        }
     } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Route not found' }));
     }
 });
 
-server.listen(PORT, () => console.log(`[SYSTEM] Orchestration Engine running on port ${PORT}...`));
+server.listen(PORT, () => console.log(`[SERVER] Context-aware metrics engine online on port ${PORT}...`));
