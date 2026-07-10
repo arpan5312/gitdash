@@ -26,7 +26,7 @@ function runCommand(cmd, args, cwd) {
 
         child.stdout.on('data', chunk => { if (!finished) stdout += chunk.toString(); });
         child.stderr.on('data', chunk => { if (!finished) stderr += chunk.toString(); });
-        
+
         child.on('close', code => {
             if (finished) return;
             finished = true;
@@ -61,6 +61,173 @@ function processCommitCoupling(files, metrics) {
 function getSafeRepoPath(repoId) {
     if (!/^[a-f0-9]{12}$/.test(repoId)) throw new Error('Malformed repository ID');
     return path.join(REPOS_DIR, repoId);
+}
+
+// ---------------------------------------------------------------------
+// Risk scoring model
+//
+// The old model ranked files by percentile within the repo. Percentile
+// only encodes ORDER, not MAGNITUDE — and in any real repo, the files
+// that actually matter (hot paths, shared modules) are correlated across
+// every metric at once (busy files also tend to have more authors, more
+// coupling, more deletions). That correlation collapses the whole
+// "important" cluster into the same high percentile band regardless of
+// how much busier one file is than another.
+//
+// This model replaces rank with magnitude: log-tamed metrics, robust
+// z-scores (median/MAD, resistant to the outliers commit histories are
+// full of), an explicit interaction term for "busy AND entangled," an
+// explicit reward for stable/additive maintenance, and a single
+// calibrated sigmoid at the end instead of averaging four percentiles.
+// Documentation files are excluded from the scoring pool entirely.
+// ---------------------------------------------------------------------
+
+function median(values) {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function mad(values, med) {
+    return median(values.map(v => Math.abs(v - med)));
+}
+
+function robustZ(value, med, madValue) {
+    return (value - med) / (1.4826 * madValue + 1e-6); // 1.4826 makes MAD comparable to std-dev
+}
+
+function sigmoid(x) {
+    return 1 / (1 + Math.exp(-x));
+}
+
+const DOC_EXTENSIONS = ['.md', '.txt', '.rst', '.adoc', 'LICENSE', 'NOTICE'];
+const INFRA_FILES = ['Dockerfile', 'Makefile', 'Jenkinsfile', 'docker-compose.yml', 'package.json', 'go.mod', 'Cargo.toml'];
+
+function isDocumentation(filePath) {
+    const fileName = path.basename(filePath);
+    return DOC_EXTENSIONS.some(ext => filePath.endsWith(ext) || fileName === ext);
+}
+
+function classifyComponent(filePath) {
+    const fileName = path.basename(filePath);
+    if (isDocumentation(filePath)) return 'documentation';
+    if (INFRA_FILES.includes(fileName)) return 'infrastructure';
+    if (filePath.startsWith('.github/')) return 'pipeline';
+    if (filePath.includes('test') || filePath.startsWith('tests/')) return 'testing';
+    return 'source_code';
+}
+
+// Calibration knobs. RISK_STEEPNESS: higher = sharper separation between
+// hotspots and everything else. RISK_OFFSET: shifts the sigmoid so a
+// typical/median file scores low instead of landing at 0.5. Tune both
+// against a repo you know well if the spread still looks off.
+const RISK_STEEPNESS = 1.15;
+const RISK_OFFSET = 0.55;
+
+function scoreRepository(rawNodes) {
+    const docNodes = rawNodes.filter(n => isDocumentation(n.id));
+    const scorable = rawNodes.filter(n => !isDocumentation(n.id));
+
+    // Log-tame the heavy-tailed counts once per scorable file. Git
+    // activity is power-law distributed — a few files have 10-100x the
+    // commits of the median file. Without this, those files alone would
+    // dominate the median/MAD and flatten everyone else's contrast.
+    const derived = scorable.map(node => {
+        const couplingDensity = node.historical_coupling_score / Math.max(node.commit_frequency, 1);
+        return {
+            node,
+            churn: Math.log1p(node.commit_frequency),
+            authors: Math.log1p(node.author_count),
+            density: Math.log1p(couplingDensity)
+        };
+    });
+
+    const churnVals = derived.map(d => d.churn);
+    const authorVals = derived.map(d => d.authors);
+    const densityVals = derived.map(d => d.density);
+
+    const churnMed = median(churnVals), churnMad = mad(churnVals, churnMed);
+    const authorMed = median(authorVals), authorMad = mad(authorVals, authorMed);
+    const densityMed = median(densityVals), densityMad = mad(densityVals, densityMed);
+
+    const finalizedNodes = derived.map(({ node, churn, authors, density }) => {
+        const zChurn = robustZ(churn, churnMed, churnMad);
+        const zAuthors = robustZ(authors, authorMed, authorMad);
+        const zDensity = robustZ(density, densityMed, densityMad);
+
+        // Only fires when a file is BOTH above-median busy AND
+        // above-median entangled — the explicit "coupled files that
+        // change together frequently" penalty, not just two averaged
+        // signals that happen to both be high.
+        const entanglement = Math.max(0, zChurn) * Math.max(0, zDensity);
+
+        // Rewards files that are actively maintained (high churn) but
+        // mostly through additions rather than deletions/rewrites.
+        // Scaled by how "alive" the file is, so an untouched file gets
+        // no spurious reward.
+        const stabilityReward = (1 - node.stability_ratio) * sigmoid(zChurn);
+
+        const rawScore =
+              0.35 * zChurn
+            + 0.25 * zDensity
+            + 0.15 * zAuthors
+            + 0.15 * node.knowledge_concentration
+            + 0.10 * entanglement
+            - 0.20 * stabilityReward;
+
+        const structuralRisk = sigmoid(RISK_STEEPNESS * (rawScore - RISK_OFFSET));
+        const componentType = classifyComponent(node.id);
+
+        let tag = 'stable_component';
+        if (componentType === 'infrastructure' || componentType === 'pipeline') {
+            tag = structuralRisk > 0.7 ? 'volatile_config_bottleneck' : 'stable_environment';
+        } else if (componentType === 'testing') {
+            tag = structuralRisk > 0.7 ? 'high_test_churn' : 'stable_test_suite';
+        } else {
+            if (structuralRisk > 0.8) tag = 'refactor_decay_hotspot';
+            else if (node.historical_coupling_score > 10 && node.author_count > 4) tag = 'shared_bottleneck';
+            else if (node.stability_ratio < 0.15 && node.commit_frequency > 5) tag = 'active_feature_growth';
+        }
+
+        return {
+            id: node.id,
+            component_type: componentType,
+            lines_of_code: node.lines_of_code,
+            commit_frequency: node.commit_frequency,
+            author_count: node.author_count,
+            historical_coupling_score: node.historical_coupling_score,
+            knowledge_owner: node.knowledge_owner,
+            bus_factor: node.bus_factor,
+            knowledge_concentration: node.knowledge_concentration,
+            behavioral_tag: tag,
+            structural_risk_index: parseFloat(structuralRisk.toFixed(2))
+        };
+    });
+
+    // Documentation is excluded from the risk contest entirely — it gets
+    // a flat, churn-only informational score so it's never flagged
+    // "critical" purely for being frequently read/edited, but a
+    // genuinely hot README still surfaces as a documentation_hotspot
+    // rather than disappearing.
+    docNodes.forEach(node => {
+        const flatRisk = Math.min(0.3, Math.log1p(node.commit_frequency) / 20);
+        finalizedNodes.push({
+            id: node.id,
+            component_type: 'documentation',
+            lines_of_code: node.lines_of_code,
+            commit_frequency: node.commit_frequency,
+            author_count: node.author_count,
+            historical_coupling_score: node.historical_coupling_score,
+            knowledge_owner: node.knowledge_owner,
+            bus_factor: node.bus_factor,
+            knowledge_concentration: node.knowledge_concentration,
+            behavioral_tag: flatRisk > 0.2 ? 'documentation_hotspot' : 'stable_docs',
+            structural_risk_index: parseFloat(flatRisk.toFixed(2))
+        });
+    });
+
+    return finalizedNodes;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -102,9 +269,9 @@ const server = http.createServer(async (req, res) => {
                 return res.end(JSON.stringify({ error: 'Ingestion failed', details: e.message }));
             }
         });
-    } 
-    
-    // ROUTE 2: Structural Pipeline, Percentile Matrix Evaluation & Edge Topological Generation
+    }
+
+    // ROUTE 2: Structural Pipeline, Risk Scoring & Edge Topological Generation
     else if (req.method === 'GET' && parsedUrl.pathname === '/api/metrics') {
         try {
             const repoId = parsedUrl.searchParams.get('id');
@@ -136,7 +303,7 @@ const server = http.createServer(async (req, res) => {
 
                 const parts = trimmed.split(/\s+/);
                 if (parts.length === 3) {
-                    if (parts[0] === '-' || parts[1] === '-') return; 
+                    if (parts[0] === '-' || parts[1] === '-') return;
 
                     const added = parseInt(parts[0], 10) || 0;
                     const deleted = parseInt(parts[1], 10) || 0;
@@ -149,7 +316,7 @@ const server = http.createServer(async (req, res) => {
                             additions: 0,
                             deletions: 0,
                             commit_frequency: 0,
-                            authors: {}, 
+                            authors: {},
                             co_changes: {} // Optimization: Set collection updated to dictionary tracking counter
                         };
                     }
@@ -167,10 +334,10 @@ const server = http.createServer(async (req, res) => {
 
             const rawNodes = [];
             const validTrackedFiles = new Set();
-            
+
             Object.keys(fileMetrics).forEach(filePath => {
                 const absolutePath = path.join(targetPath, filePath);
-                
+
                 try {
                     const stats = fs.statSync(absolutePath);
                     if (!stats.isFile() || stats.size > 1024 * 1024) return;
@@ -217,67 +384,7 @@ const server = http.createServer(async (req, res) => {
                 return res.end(JSON.stringify({ status: 'success', repo_id: repoId, nodes: [], links: [] }));
             }
 
-            const getPercentile = (arr, val, key) => {
-                const lowerCount = arr.filter(item => item[key] <= val).length;
-                return lowerCount / arr.length;
-            };
-
-            const DOC_EXTENSIONS = ['.md', '.txt', '.rst', '.adoc', 'LICENSE', 'NOTICE'];
-            const INFRA_FILES = ['Dockerfile', 'Makefile', 'Jenkinsfile', 'docker-compose.yml', 'package.json', 'go.mod', 'Cargo.toml'];
-            const PIPELINE_EXTENSIONS = ['.yml', '.yaml', '.json'];
-
-            const finalizedNodes = rawNodes.map(node => {
-                const pFreq = getPercentile(rawNodes, node.commit_frequency, 'commit_frequency');
-                const pAuthors = getPercentile(rawNodes, node.author_count, 'author_count');
-                const pStability = getPercentile(rawNodes, node.stability_ratio, 'stability_ratio');
-                const pCoupling = getPercentile(rawNodes, node.historical_coupling_score, 'historical_coupling_score');
-
-                const compositeRisk = (pFreq * 0.3) + (pAuthors * 0.2) + (pStability * 0.4) + (pCoupling * 0.1);
-
-                const fileName = path.basename(node.id);
-                let componentType = 'source_code';
-                let tag = 'stable_component';
-
-                if (DOC_EXTENSIONS.some(ext => node.id.endsWith(ext) || fileName === ext)) {
-                    componentType = 'documentation';
-                } else if (INFRA_FILES.includes(fileName)) {
-                    componentType = 'infrastructure';
-                } else if (node.id.startsWith('.github/')) { // Optimization: Widened match scope covering infrastructure profiles
-                    componentType = 'pipeline';
-                } else if (node.id.includes('test') || node.id.startsWith('tests/')) {
-                    componentType = 'testing';
-                }
-
-                if (componentType === 'documentation') {
-                    tag = compositeRisk > 0.75 ? 'documentation_hotspot' : 'stable_docs';
-                } else if (componentType === 'infrastructure' || componentType === 'pipeline') {
-                    tag = compositeRisk > 0.75 ? 'volatile_config_bottleneck' : 'stable_environment';
-                } else if (componentType === 'testing') {
-                    tag = compositeRisk > 0.75 ? 'high_test_churn' : 'stable_test_suite';
-                } else {
-                    if (compositeRisk > 0.8) {
-                        tag = 'refactor_decay_hotspot';
-                    } else if (node.historical_coupling_score > 10 && node.author_count > 4) {
-                        tag = 'shared_bottleneck';
-                    } else if (node.stability_ratio < 0.15 && node.commit_frequency > 5) {
-                        tag = 'active_feature_growth';
-                    }
-                }
-
-                return {
-                    id: node.id,
-                    component_type: componentType,
-                    lines_of_code: node.lines_of_code,
-                    commit_frequency: node.commit_frequency,
-                    author_count: node.author_count,
-                    historical_coupling_score: node.historical_coupling_score,
-                    knowledge_owner: node.knowledge_owner,
-                    bus_factor: node.bus_factor,
-                    knowledge_concentration: node.knowledge_concentration,
-                    behavioral_tag: tag,
-                    structural_risk_index: parseFloat(compositeRisk.toFixed(2))
-                };
-            });
+            const finalizedNodes = scoreRepository(rawNodes);
 
             // Weighted Topological Link Extraction & Mapping
             const links = [];
