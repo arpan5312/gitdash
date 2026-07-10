@@ -1,56 +1,54 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { AnimatePresence } from 'framer-motion';
-import Hero from './components/Hero';
-import LoadingPipeline from './components/LoadingPipeline';
-import Dashboard from './components/Dashboard';
-import HudFrame from './components/HudFrame';
-import { analyzeRepository, ApiError, fetchMetrics } from './api';
-import type { MetricsResponse } from './types';
+import Hero from './components/Hero/Hero';
+import Dashboard from './components/Dashboard/Dashboard';
+import { analyzeRepository, ApiError } from './api/client';
 
-type Stage = 'hero' | 'loading' | 'dashboard';
+type Screen = 'hero' | 'dashboard';
 
 export default function App() {
-  const [stage, setStage] = useState<Stage>('hero');
-  const [repoUrl, setRepoUrl] = useState('');
-  const [data, setData] = useState<MetricsResponse | null>(null);
+  const [screen, setScreen] = useState<Screen>('hero');
+  const [repoId, setRepoId] = useState<string | null>(null);
+  const [repoUrl, setRepoUrl] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
-  const [requestDone, setRequestDone] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
-  async function handleAnalyze(url: string) {
+  const handleAnalyze = useCallback(async (url: string) => {
     setError(null);
+    setIsAnalyzing(true);
     setRepoUrl(url);
-    setRequestDone(false);
-    setStage('loading');
-
     try {
-      const { repo_id } = await analyzeRepository(url);
-      const metrics = await fetchMetrics(repo_id);
-      setData(metrics);
-      setRequestDone(true);
-      // let the last pipeline step land before revealing the dashboard
-      setTimeout(() => setStage('dashboard'), 700);
-    } catch (e) {
-      const message = e instanceof ApiError ? e.message : 'Something went wrong. Try again.';
+      const result = await analyzeRepository(url);
+      setRepoId(result.repo_id);
+      setScreen('dashboard');
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Unable to reach the analysis engine.';
       setError(message);
-      setStage('hero');
+    } finally {
+      setIsAnalyzing(false);
     }
-  }
+  }, []);
 
-  function handleReset() {
-    setStage('hero');
-    setData(null);
+  const handleReset = useCallback(() => {
+    setScreen('hero');
+    setRepoId(null);
     setRepoUrl('');
-    setRequestDone(false);
-  }
+    setError(null);
+  }, []);
 
   return (
-    <div className="min-h-screen">
-      <HudFrame />
+    <div className="min-h-screen w-full">
       <AnimatePresence mode="wait">
-        {stage === 'hero' && <Hero key="hero" onAnalyze={handleAnalyze} error={error} />}
-        {stage === 'loading' && <LoadingPipeline key="loading" done={requestDone} />}
-        {stage === 'dashboard' && data && (
-          <Dashboard key="dashboard" data={data} repoUrl={repoUrl} onReset={handleReset} />
+        {screen === 'hero' && (
+          <Hero
+            key="hero"
+            onAnalyze={handleAnalyze}
+            isAnalyzing={isAnalyzing}
+            error={error}
+          />
+        )}
+        {screen === 'dashboard' && repoId && (
+          <Dashboard key="dashboard" repoId={repoId} repoUrl={repoUrl} onReset={handleReset} />
         )}
       </AnimatePresence>
     </div>

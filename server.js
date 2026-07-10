@@ -1,11 +1,16 @@
+require('dotenv').config();
 const http = require('http');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const PORT = 5000;
 const REPOS_DIR = path.resolve('./repos');
+
+// Initialize Gemini SDK via environment variables
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 if (!fs.existsSync(REPOS_DIR)) { fs.mkdirSync(REPOS_DIR); }
 
@@ -667,6 +672,70 @@ const server = http.createServer(async (req, res) => {
             return res.end(JSON.stringify({ error: err.message }));
         }
     } 
+
+    // ROUTE 4: LLM Architecture Summary Layer via Gemini
+    else if (req.method === 'GET' && parsedUrl.pathname === '/api/ai-summary') {
+        try {
+            const repoId = parsedUrl.searchParams.get('id');
+            if (!repoId) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'Missing target repository ID parameter' }));
+            }
+
+            // Query internally generated metrics metadata directly
+            const summaryResponse = await fetch(
+                `http://localhost:${PORT}/api/repository-summary?id=${repoId}`
+            );
+            
+            if (!summaryResponse.ok) {
+                const errData = await summaryResponse.json();
+                throw new Error(errData.error || 'Failed to retrieve repository data mapping summary');
+            }
+            
+            const summary = await summaryResponse.json();
+
+            const prompt = `
+You are a senior software architect.
+
+Analyze this repository intelligence report.
+
+Repository health score: ${summary.repository_health}
+
+Hotspots: ${JSON.stringify(summary.hotspots, null, 2)}
+
+Ownership risks: ${JSON.stringify(summary.ownership_risks, null, 2)}
+
+Bottlenecks: ${JSON.stringify(summary.bottlenecks, null, 2)}
+
+Strong relationships: ${JSON.stringify(summary.strongest_relationships, null, 2)}
+
+Return:
+
+1. Architecture overview.
+2. Major engineering risks.
+3. Technical debt hotspots.
+4. Knowledge bottlenecks.
+5. Refactoring recommendations.
+
+Keep the answer concise and actionable.
+`;
+
+            const model = genAI.getGenerativeModel({
+                model: "gemini-1.5-flash"
+            });
+            const result = await model.generateContent(prompt);
+            const text = result.response.text();
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({
+                status: 'success',
+                analysis: text
+            }));
+        } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'AI summary analysis generation pipeline crashed', details: err.message }));
+        }
+    }
     
     else {
         res.writeHead(404, { 'Content-Type': 'application/json' });

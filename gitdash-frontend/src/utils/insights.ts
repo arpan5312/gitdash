@@ -1,89 +1,57 @@
-import type { Insight, RepoLink, RepoNode } from '../types';
+import type { RepositorySummaryResponse } from '../types';
 
-function nodeId(n: string | RepoNode): string {
-  return typeof n === 'string' ? n : n.id;
+export interface Insight {
+  id: string;
+  icon: string;
+  text: string;
 }
 
-export function generateInsights(nodes: RepoNode[], links: RepoLink[]): Insight[] {
+/**
+ * Derives readable insight strings strictly from fields already present in the
+ * /api/repository-summary response. No values are invented.
+ */
+export function buildInsights(summary: RepositorySummaryResponse): Insight[] {
   const insights: Insight[] = [];
-  if (nodes.length === 0) return insights;
 
-  const byRisk = [...nodes].sort((a, b) => b.structural_risk_index - a.structural_risk_index);
-  const topRisk = byRisk[0];
-  if (topRisk && topRisk.structural_risk_index >= 0.7) {
+  summary.hotspots.forEach((h) => {
     insights.push({
-      id: `risk-${topRisk.id}`,
+      id: `hotspot-${h.file}`,
       icon: '⚠',
-      severity: 'critical',
-      text: `${topRisk.id} is a structural hotspot with unusually high churn.`
+      text: `${h.file} is a structural hotspot (risk ${Math.round(h.risk * 100)}%).`
     });
-  }
+  });
 
-  const docHotspot = nodes.find((n) => n.behavioral_tag === 'documentation_hotspot');
-  if (docHotspot) {
+  summary.ownership_risks.forEach((o) => {
     insights.push({
-      id: `doc-${docHotspot.id}`,
-      icon: '📚',
-      severity: 'info',
-      text: `${docHotspot.id} acts as a documentation hotspot.`
-    });
-  }
-
-  const testChurn = nodes
-    .filter((n) => n.behavioral_tag === 'high_test_churn')
-    .sort((a, b) => b.structural_risk_index - a.structural_risk_index)[0];
-  if (testChurn) {
-    insights.push({
-      id: `test-${testChurn.id}`,
-      icon: '🧪',
-      severity: 'warning',
-      text: `${testChurn.id} experiences heavy test churn.`
-    });
-  }
-
-  const stableInfra = nodes.find(
-    (n) => n.component_type === 'infrastructure' && n.behavioral_tag === 'stable_environment'
-  );
-  if (stableInfra) {
-    insights.push({
-      id: `infra-${stableInfra.id}`,
-      icon: '🏗',
-      severity: 'info',
-      text: `${stableInfra.id} behaves as stable infrastructure.`
-    });
-  }
-
-  const bottleneck = nodes.find((n) => n.behavioral_tag === 'shared_bottleneck');
-  if (bottleneck) {
-    insights.push({
-      id: `bottleneck-${bottleneck.id}`,
-      icon: '🧩',
-      severity: 'warning',
-      text: `${bottleneck.id} is a shared bottleneck touched across many workflows.`
-    });
-  }
-
-  const topLink = [...links].sort((a, b) => b.weight - a.weight)[0];
-  if (topLink && topLink.weight >= 10) {
-    insights.push({
-      id: `coupling-${nodeId(topLink.source)}-${nodeId(topLink.target)}`,
-      icon: '🔗',
-      severity: 'warning',
-      text: `${nodeId(topLink.source)} and ${nodeId(topLink.target)} exhibit strong historical coupling.`
-    });
-  }
-
-  const singleOwner = nodes
-    .filter((n) => n.bus_factor === 1 && n.commit_frequency > 5)
-    .sort((a, b) => b.commit_frequency - a.commit_frequency)[0];
-  if (singleOwner) {
-    insights.push({
-      id: `owner-${singleOwner.id}`,
+      id: `owner-${o.file}`,
       icon: '👤',
-      severity: 'critical',
-      text: `${singleOwner.id} has a bus factor of 1 — only ${singleOwner.knowledge_owner} maintains it.`
+      text: `${o.file} is owned almost entirely by ${o.owner} — a single point of failure.`
     });
-  }
+  });
+
+  summary.volatile_configs.forEach((v) => {
+    insights.push({
+      id: `config-${v.file}`,
+      icon: '🏗',
+      text: `${v.file} behaves as core infrastructure.`
+    });
+  });
+
+  summary.strongest_relationships.slice(0, 5).forEach((r) => {
+    insights.push({
+      id: `rel-${r.source}-${r.target}`,
+      icon: '🔗',
+      text: `${r.source} and ${r.target} exhibit strong coupling (weight ${r.weight}).`
+    });
+  });
+
+  summary.bottlenecks.slice(0, 3).forEach((b) => {
+    insights.push({
+      id: `bottleneck-${b.file}`,
+      icon: '🧭',
+      text: `${b.file} is a coupling bottleneck, entangled with ${b.coupling} other files.`
+    });
+  });
 
   return insights;
 }

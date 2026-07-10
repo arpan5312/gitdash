@@ -1,8 +1,10 @@
-# GitDash — frontend
+# GitDash Frontend
 
-Repository intelligence dashboard. React + TypeScript + Tailwind + Framer Motion,
-force-directed graph via `react-force-graph-2d`, wired to the GitDash backend
-running at `http://localhost:5000`.
+Repository-intelligence dashboard: React + TypeScript + Tailwind + Framer Motion + react-force-graph-2d.
+
+Talks to the existing backend at `http://localhost:5000` (see `src/api/client.ts` for the exact endpoints
+used — `/api/analyze`, `/api/metrics`, `/api/repository-summary`, `/api/ai-summary`. No endpoints were
+invented and no backend logic was touched).
 
 ## Setup
 
@@ -11,69 +13,31 @@ npm install
 npm run dev
 ```
 
-The dev server runs on `http://localhost:5173`. Make sure the backend
-(`node server.js`) is running on port 5000 first — CORS is already open on
-the backend for local development.
+Then open the printed local URL (default `http://localhost:5173`). Make sure the backend server is
+already running on port 5000 (`node server.js` or however you start it) — the frontend does not proxy
+or mock any data.
 
 ## Structure
 
 ```
 src/
-  App.tsx                 stage machine: hero → loading pipeline → dashboard
-  api.ts                  fetch wrappers for /api/analyze and /api/metrics
-  theme.ts                component-type colors, behavior labels, risk scale
-  types.ts                shared types mirroring the backend response shape
-  utils/insights.ts        client-side "insights engine" over nodes + links
+  api/client.ts              -> isolated fetch wrappers for the 4 backend endpoints
+  types/index.ts              -> TypeScript types mirroring the backend data model exactly
+  utils/visualMap.ts          -> component/risk color + label mappings
+  utils/insights.ts           -> derives the Insights panel bullets from repository-summary fields
   components/
-    Hero.tsx              landing page, URL input
-    LoadingPipeline.tsx    animated analysis steps
-    Dashboard.tsx          composes KPI cards, graph, side panel, insights
-    KPICards.tsx           top-row summary metrics
-    GraphView.tsx          react-force-graph-2d canvas rendering + interactions
-    SidePanel.tsx          clicked-node detail panel
-    InsightsFeed.tsx       right-rail insight list
-    HudFrame.tsx           ambient corner-bracket / scanline framing device
+    Hero/                      -> landing page, URL input, staged loading animation
+    Dashboard/                 -> page shell + KPI cards
+    Graph/                     -> the force-directed graph, tooltip, and click side-panel
+    Insights/                  -> insights list panel
+    AIReport/                  -> collapsible AI Architecture Review panel (markdown)
 ```
 
 ## Notes on the graph
 
-- Node **size** encodes `structural_risk_index`, node **glow** encodes
-  `knowledge_concentration`, node **color** encodes `component_type`.
-- Edge **thickness** and **opacity** both encode `weight` (co-change
-  frequency).
-- Labels only render on hover, on the selected node, or once you've zoomed
-  in past ~3.2×. On a 300+ file repo this keeps the graph legible instead
-  of turning into label spaghetti — zoom into a cluster to read it.
-- `react-force-graph-2d`'s public API shifts a little between versions;
-  if a prop name in `GraphView.tsx` (e.g. `onZoom`, `enablePanInteraction`)
-  doesn't match your installed version, check that package's README —
-  the rendering logic (`nodeCanvasObject`/`linkCanvasObject`) is the part
-  that matters and is stable across versions.
-
-## A caveat on risk scores
-
-The backend computes `structural_risk_index` as a **percentile relative to
-the other files in the same analyzed repo**. That's a reasonable idea for a
-large, mature codebase with real variance across commits/authors — but on a
-small or freshly-created repo (few commits, one author), most files tie at
-the top percentile and everything reports as "critical" even though nothing
-unusual is actually happening. Treat risk scores as unreliable below
-roughly a few dozen commits / a handful of authors, and consider having the
-backend flag or suppress the score under that floor rather than reporting
-a misleadingly confident number.
-
-The graph's node **size** and **glow** are locally re-normalized (min-max
-across whatever repo is currently loaded) purely for the visual encoding,
-so you still get visible size/brightness variation even when the backend's
-percentiles are bunched near 1.0 on a small repo. The raw numbers shown in
-the side panel are untouched — only the drawing is rescaled.
-
-## Design tokens
-
-- Background: near-black graphite (`#07080B` → `#0A0C10`), not pure black.
-- Accent: teal-cyan (`#38D9C4`) for interactive chrome — kept separate from
-  the node palette so UI and data don't compete.
-- Type: Space Grotesk (display), IBM Plex Mono (data/labels/timestamps),
-  Inter (body/insight copy).
-- Component colors are fixed by the data contract: source → red,
-  docs → blue, testing → green, infra → orange, pipeline → purple.
+- Collision (`forceCollide`), repulsion (`forceManyBody`), and link forces (`forceLink`) are tuned in
+  `components/Graph/graphConfig.ts` — adjust `FORCE_CONFIG` there if a given repo still feels cramped.
+- Node radius encodes `structural_risk_index`; glow strength encodes `knowledge_concentration`.
+- Labels are suppressed by default and only drawn on hover, on selection, or once the camera is zoomed
+  in past `LABEL_ZOOM_THRESHOLD`, so dense repos stay legible.
+- The camera auto-fits once the simulation's first cooldown completes (`onEngineStop`).
