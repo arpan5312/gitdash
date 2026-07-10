@@ -50,6 +50,24 @@ src/
   the rendering logic (`nodeCanvasObject`/`linkCanvasObject`) is the part
   that matters and is stable across versions.
 
+## A caveat on risk scores
+
+The backend computes `structural_risk_index` as a **percentile relative to
+the other files in the same analyzed repo**. That's a reasonable idea for a
+large, mature codebase with real variance across commits/authors — but on a
+small or freshly-created repo (few commits, one author), most files tie at
+the top percentile and everything reports as "critical" even though nothing
+unusual is actually happening. Treat risk scores as unreliable below
+roughly a few dozen commits / a handful of authors, and consider having the
+backend flag or suppress the score under that floor rather than reporting
+a misleadingly confident number.
+
+The graph's node **size** and **glow** are locally re-normalized (min-max
+across whatever repo is currently loaded) purely for the visual encoding,
+so you still get visible size/brightness variation even when the backend's
+percentiles are bunched near 1.0 on a small repo. The raw numbers shown in
+the side panel are untouched — only the drawing is rescaled.
+
 ## Design tokens
 
 - Background: near-black graphite (`#07080B` → `#0A0C10`), not pure black.

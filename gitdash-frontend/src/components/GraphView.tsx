@@ -1,5 +1,6 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph2D, { ForceGraphMethods, NodeObject, LinkObject } from 'react-force-graph-2d';
+import { forceCollide } from 'd3-force';
 import type { RepoLink, RepoNode } from '../types';
 import { COMPONENT_COLOR } from '../theme';
 
@@ -15,15 +16,38 @@ interface GraphViewProps {
 // into a bowl of spaghetti.
 const LABEL_ZOOM_THRESHOLD = 3.2;
 
-const MIN_NODE_R = 3.5;
-const MAX_NODE_R = 16;
+const MIN_NODE_R = 4;
+const MAX_NODE_R = 15;
 
 function nodeId(n: string | RepoNode | NodeObject): string {
   return typeof n === 'string' ? n : (n as RepoNode).id;
 }
 
+/**
+ * Backend risk/ownership scores are percentile-relative to the analyzed
+ * repo. On a small or single-author repo that means most files tie near
+ * the top and every node looks maxed out. We re-normalize locally (min-max
+ * across the currently loaded graph) purely for the *visual encoding*, so
+ * size/glow still show relative differences even when the underlying repo
+ * doesn't have enough history for the backend's percentiles to spread out.
+ * The raw numbers in the side panel are left untouched — this only affects
+ * how big/bright a node is drawn.
+ */
+function useLocalScale(nodes: RepoNode[], key: keyof RepoNode) {
+  return useMemo(() => {
+    const values = nodes.map((n) => Number(n[key]) || 0);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = max - min || 1;
+    const map = new Map<string, number>();
+    nodes.forEach((n) => map.set(n.id, ((Number(n[key]) || 0) - min) / span));
+    return map;
+  }, [nodes, key]);
+}
+
 export default function GraphView({ nodes, links, onSelectNode, selectedId }: GraphViewProps) {
   const fgRef = useRef<ForceGraphMethods<NodeObject, LinkObject> | undefined>(undefined);
+  const containerRef = useRef<HTMLDivElement>(null);
   const [hoverNode, setHoverNode] = useState<RepoNode | null>(null);
   const [zoom, setZoom] = useState(1);
 
@@ -35,10 +59,36 @@ export default function GraphView({ nodes, links, onSelectNode, selectedId }: Gr
     [nodes, links]
   );
 
-  const radiusFor = useCallback((n: RepoNode) => {
-    const risk = Math.max(0, Math.min(1, n.structural_risk_index ?? 0));
-    return MIN_NODE_R + risk * (MAX_NODE_R - MIN_NODE_R);
-  }, []);
+  const riskScale = useLocalScale(nodes, 'structural_risk_index');
+  const ownershipScale = useLocalScale(nodes, 'knowledge_concentration');
+
+  const radiusFor = useCallback(
+    (n: RepoNode) => {
+      const t = riskScale.get(n.id) ?? 0;
+      return MIN_NODE_R + t * (MAX_NODE_R - MIN_NODE_R);
+    },
+    [riskScale]
+  );
+
+  // Tune the physics once per dataset: real collision so nodes can never
+  // overlap, stronger repulsion so dense/small repos still spread out, and
+  // link distance that reacts to weight without letting anything collapse
+  // to zero.
+  useEffect(() => {
+    const fg = fgRef.current as any;
+    if (!fg) return;
+
+    fg.d3Force('charge')?.strength(-260).distanceMax(600);
+    fg.d3Force('link')?.distance((l: any) => {
+      const w = l.weight ?? 1;
+      return Math.max(70, 160 - w * 3);
+    });
+    fg.d3Force(
+      'collide',
+      forceCollide((n: any) => radiusFor(n as RepoNode) + 18).strength(1)
+    );
+    fg.d3ReheatSimulation?.();
+  }, [graphData, radiusFor]);
 
   const drawNode = useCallback(
     (node: NodeObject, ctx: CanvasRenderingContext2D, globalScale: number) => {
@@ -50,13 +100,15 @@ export default function GraphView({ nodes, links, onSelectNode, selectedId }: Gr
       const isHovered = hoverNode?.id === n.id;
       const isSelected = selectedId === n.id;
 
-      // glow proportional to knowledge concentration — the more one person
-      // "owns" a file, the more it visually radiates
-      const glowStrength = Math.max(0, Math.min(1, n.knowledge_concentration ?? 0));
-      if (glowStrength > 0.05) {
-        const glowR = r * (1.6 + glowStrength * 1.8);
-        const gradient = ctx.createRadialGradient(x, y, r * 0.4, x, y, glowR);
-        gradient.addColorStop(0, `${color}55`);
+      // glow proportional to (locally-scaled) knowledge concentration — the
+      // more one person "owns" a file relative to the rest of this repo,
+      // the more it visually radiates. Kept modest so dense graphs don't
+      // turn into one solid wash of color.
+      const glowStrength = ownershipScale.get(n.id) ?? 0;
+      if (glowStrength > 0.08) {
+        const glowR = r * (1.25 + glowStrength * 0.9);
+        const gradient = ctx.createRadialGradient(x, y, r * 0.5, x, y, glowR);
+        gradient.addColorStop(0, `${color}40`);
         gradient.addColorStop(1, `${color}00`);
         ctx.beginPath();
         ctx.fillStyle = gradient;
@@ -79,7 +131,7 @@ export default function GraphView({ nodes, links, onSelectNode, selectedId }: Gr
 
       const showLabel = isHovered || isSelected || globalScale > LABEL_ZOOM_THRESHOLD;
       if (showLabel) {
-        const fontSize = Math.max(10, 11) / globalScale;
+        const fontSize = 11 / globalScale;
         ctx.font = `${fontSize}px "IBM Plex Mono", monospace`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
@@ -87,7 +139,7 @@ export default function GraphView({ nodes, links, onSelectNode, selectedId }: Gr
         const textY = y + r + 3;
         const metrics = ctx.measureText(label);
         const padX = 4 / globalScale;
-        ctx.fillStyle = 'rgba(7,8,11,0.75)';
+        ctx.fillStyle = 'rgba(7,8,11,0.82)';
         ctx.fillRect(
           x - metrics.width / 2 - padX,
           textY - 1,
@@ -98,7 +150,7 @@ export default function GraphView({ nodes, links, onSelectNode, selectedId }: Gr
         ctx.fillText(label, x, textY);
       }
     },
-    [hoverNode, selectedId, radiusFor]
+    [hoverNode, selectedId, radiusFor, ownershipScale]
   );
 
   const drawLink = useCallback((link: LinkObject, ctx: CanvasRenderingContext2D) => {
@@ -108,8 +160,8 @@ export default function GraphView({ nodes, links, onSelectNode, selectedId }: Gr
     if (!s || !t || s.x === undefined || t.x === undefined) return;
 
     const weight = l.weight ?? 1;
-    const width = Math.min(0.4 + weight * 0.12, 6);
-    const opacity = Math.min(0.08 + weight * 0.03, 0.85);
+    const width = Math.min(0.4 + weight * 0.1, 4.5);
+    const opacity = Math.min(0.06 + weight * 0.02, 0.6);
 
     ctx.beginPath();
     ctx.moveTo(s.x!, s.y!);
@@ -120,7 +172,10 @@ export default function GraphView({ nodes, links, onSelectNode, selectedId }: Gr
   }, []);
 
   return (
-    <div className="relative h-full w-full overflow-hidden rounded-lg border border-base-border bg-base-950/60">
+    <div
+      ref={containerRef}
+      className="relative h-full w-full overflow-hidden rounded-lg border border-base-border bg-base-950/60"
+    >
       <ForceGraph2D
         ref={fgRef as any}
         graphData={graphData}
@@ -132,12 +187,14 @@ export default function GraphView({ nodes, links, onSelectNode, selectedId }: Gr
         nodeCanvasObjectMode={() => 'replace'}
         linkCanvasObject={drawLink}
         linkCanvasObjectMode={() => 'replace'}
-        cooldownTicks={200}
-        d3VelocityDecay={0.35}
+        cooldownTicks={300}
+        d3AlphaDecay={0.02}
+        d3VelocityDecay={0.28}
         onNodeHover={(n) => setHoverNode((n as unknown as RepoNode) ?? null)}
         onNodeClick={(n) => onSelectNode(n as unknown as RepoNode)}
         onZoom={(t) => setZoom(t.k)}
         onZoomEnd={(t) => setZoom(t.k)}
+        onEngineStop={() => fgRef.current?.zoomToFit(500, 60)}
         enableNodeDrag={true}
         enablePanInteraction={true}
         enableZoomInteraction={true}
