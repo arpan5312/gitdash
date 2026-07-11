@@ -4,17 +4,16 @@ const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { GoogleGenAI } = require("@google/genai");
 
 const PORT = 5000;
 const REPOS_DIR = path.resolve('./repos');
 
 // Initialize Gemini SDK via environment variables
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 if (!fs.existsSync(REPOS_DIR)) { fs.mkdirSync(REPOS_DIR); }
 
-// Secure Helper: Run OS process as an asynchronous stream promise with resource guard
 function runCommand(cmd, args, cwd) {
     return new Promise((resolve, reject) => {
         const child = spawn(cmd, args, { cwd, shell: false });
@@ -49,14 +48,12 @@ function runCommand(cmd, args, cwd) {
     });
 }
 
-// Bug Fix: Hardened process coupling to prevent runtime object crashes
 function processCommitCoupling(files, metrics) {
     if (files.length < 2) return;
     files.forEach(a => {
-        if (!metrics[a]) return; // Reference guard boundary
+        if (!metrics[a]) return;
         files.forEach(b => {
             if (a !== b) {
-                // Optimization: Track raw edge co-change frequencies via a map dictionary
                 metrics[a].co_changes[b] = (metrics[a].co_changes[b] || 0) + 1;
             }
         });
@@ -67,10 +64,6 @@ function getSafeRepoPath(repoId) {
     if (!/^[a-f0-9]{12}$/.test(repoId)) throw new Error('Malformed repository ID');
     return path.join(REPOS_DIR, repoId);
 }
-
-// ---------------------------------------------------------------------
-// Risk scoring model
-// ---------------------------------------------------------------------
 
 function median(values) {
     if (values.length === 0) return 0;
@@ -84,7 +77,7 @@ function mad(values, med) {
 }
 
 function robustZ(value, med, madValue) {
-    return (value - med) / (1.4826 * madValue + 1e-6); // 1.4826 makes MAD comparable to std-dev
+    return (value - med) / (1.4826 * madValue + 1e-6);
 }
 
 function sigmoid(x) {
@@ -207,7 +200,6 @@ const server = http.createServer(async (req, res) => {
 
     const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
 
-    // ROUTE 1: Ingest Repo Target
     if (req.method === 'POST' && parsedUrl.pathname === '/api/analyze') {
         let body = '';
         req.on('data', chunk => body += chunk.toString());
@@ -239,7 +231,6 @@ const server = http.createServer(async (req, res) => {
         });
     }
 
-    // ROUTE 2: Structural Pipeline, Risk Scoring & Edge Topological Generation
     else if (req.method === 'GET' && parsedUrl.pathname === '/api/metrics') {
         try {
             const repoId = parsedUrl.searchParams.get('id');
@@ -354,7 +345,6 @@ const server = http.createServer(async (req, res) => {
 
             const finalizedNodes = scoreRepository(rawNodes);
 
-            // Weighted Topological Link Extraction & Mapping
             const links = [];
             const seenNetworkEdges = new Set();
 
@@ -377,9 +367,6 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            // ==========================================
-            // REFINED PRODUCTION-SAFE PRUNING STAGE
-            // ==========================================
             const targetNodeCount = Math.max(1, Math.ceil(finalizedNodes.length * 0.2));
             const topCoupledNodes = [...finalizedNodes]
                 .sort((a, b) => b.historical_coupling_score - a.historical_coupling_score)
@@ -437,7 +424,6 @@ const server = http.createServer(async (req, res) => {
         }
     }
 
-    // ROUTE 3: Repository Summary Extraction Stage
     else if (req.method === 'GET' && parsedUrl.pathname === '/api/repository-summary') {
         try {
             const repoId = parsedUrl.searchParams.get('id');
@@ -574,7 +560,6 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            // Exact duplication of the production-safe pruning stage
             const targetNodeCount = Math.max(1, Math.ceil(finalizedNodes.length * 0.2));
             const topCoupledNodes = [...finalizedNodes]
                 .sort((a, b) => b.historical_coupling_score - a.historical_coupling_score)
@@ -617,7 +602,6 @@ const server = http.createServer(async (req, res) => {
                 node => connectedNodeIds.has(node.id)
             );
 
-            // Summary metrics generations
             const hotspots = finalNodes
                 .filter(n => n.structural_risk_index > 0.8)
                 .slice(0, 5)
@@ -673,7 +657,6 @@ const server = http.createServer(async (req, res) => {
         }
     } 
 
-    // ROUTE 4: LLM Architecture Summary Layer via Gemini
     else if (req.method === 'GET' && parsedUrl.pathname === '/api/ai-summary') {
         try {
             const repoId = parsedUrl.searchParams.get('id');
@@ -682,7 +665,6 @@ const server = http.createServer(async (req, res) => {
                 return res.end(JSON.stringify({ error: 'Missing target repository ID parameter' }));
             }
 
-            // Query internally generated metrics metadata directly
             const summaryResponse = await fetch(
                 `http://localhost:${PORT}/api/repository-summary?id=${repoId}`
             );
@@ -720,11 +702,11 @@ Return:
 Keep the answer concise and actionable.
 `;
 
-            const model = genAI.getGenerativeModel({
-                model: "gemini-2.5-flash"
+            const result = await genAI.models.generateContent({
+                model: "gemini-3.5-flash",
+                contents: prompt
             });
-            const result = await model.generateContent(prompt);
-            const text = result.response.text();
+            const text = result.text;
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({
