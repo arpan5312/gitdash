@@ -1,0 +1,38 @@
+# Environment variables (NEVER commit these)
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+build/
+**/dist/
+**/build/
+
+# Cloned repos your backend analyzes (these get huge fast)
+repos/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# Vite cache
+.vite/
+
+# TypeScript build info
+*.tsbuildinfo
